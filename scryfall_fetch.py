@@ -83,6 +83,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -174,25 +175,60 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
     function pure (no hidden time dependency) and lets both fetch paths
     produce identical-shaped entries.
 
-    Handles the special case of multi-faced cards (double-faced, split,
-    adventure, modal DFC), where the top-level `oracle_text` is missing
-    and per-face text lives under `card_faces[*].oracle_text`.
+    Multi-faced card handling (transform DFC, MDFC, split, adventure,
+    meld) — Scryfall doesn't populate the same top-level fields for every
+    layout:
+
+        - Transform DFCs (e.g. Delver of Secrets): top-level `mana_cost`
+          is the front face's cost, top-level `type_line` is combined
+          ("Creature — Human Wizard // Creature — Human Insect").
+        - Modal DFCs (e.g. Bala Ged Recovery // Bala Ged Sanctuary):
+          top-level `mana_cost` is null, top-level `oracle_text` is null,
+          top-level `type_line` is combined ("Sorcery // Land"). All the
+          real per-face data lives under `card_faces[*]`.
+
+    So for `mana_cost` and `type_line` we prefer the top-level value when
+    it's populated (truthy) and fall back to a per-face string joined
+    with " // " otherwise — the same convention Scryfall uses for
+    combined card names ("Bedroom // Livingroom", "Bala Ged Recovery //
+    Bala Ged Sanctuary"). Single-faced cards always take the top-level
+    value. `oracle_text` keeps its `\\n---\\n`-joined form because
+    downstream text processing wants a single searchable blob and the
+    clearer face boundary helps NLP tokenisers.
 
     Note: `scryfall_id` is kept inside the value even though it's the key
     in the cache, so downstream code that reads a card value can identify
     it without needing to know which key it came from.
     """
+    faces = data.get("card_faces") or []
+
+    def pick(field: str):
+        """Top-level value if populated, else per-face values joined with " // ".
+
+        Single-faced cards (no `card_faces`) always take the top-level
+        value verbatim — including None / empty string, which faithfully
+        reflects Scryfall's own representation. When falling back to
+        per-face values, None / missing entries are normalised to empty
+        strings so the joined output stays a valid string (e.g. an MDFC
+        with a land back face becomes "{2}{G} // ").
+        """
+        top = data.get(field)
+        if top or not faces:
+            return top
+        return " // ".join(f.get(field) or "" for f in faces)
+
     oracle_text = data.get("oracle_text")
-    if oracle_text is None and "card_faces" in data:
+    if oracle_text is None and faces:
         # Join each face's oracle text with a visible separator so the
         # combined string preserves face boundaries for downstream code.
         oracle_text = "\n---\n".join(
-            face.get("oracle_text", "") for face in data["card_faces"]
+            face.get("oracle_text", "") for face in faces
         )
+
     return {
         "name": data.get("name"),
-        "mana_cost": data.get("mana_cost"),
-        "type_line": data.get("type_line"),
+        "mana_cost": pick("mana_cost"),
+        "type_line": pick("type_line"),
         "oracle_text": oracle_text,
         "scryfall_id": data.get("id"),
         "updated_at": updated_at,
@@ -397,28 +433,74 @@ def has_stale_cards(cards: dict, snapshot_updated_at: str) -> bool:
 # Input parsing
 # ---------------------------------------------------------------------------
 
+# Strips a leading sideboard marker like "SB: " that some deck export
+# formats use to separate sideboard cards from the main deck.
+_DECKLIST_SIDEBOARD_RE = re.compile(r"^\s*SB:\s*", re.IGNORECASE)
+# Strips a leading copy-count prefix like "1 " or "4x " that the standard
+# MTG decklist format uses. `x` after the digit(s) is optional and case-
+# insensitive; trailing whitespace after the count is required so we
+# don't clip the first word of a card name that happens to start with a
+# digit (which shouldn't exist for real cards, but the guard is cheap).
+_DECKLIST_LEADING_QTY_RE = re.compile(r"^\s*\d+x?\s+", re.IGNORECASE)
+# Strips a trailing set+collector suffix like " (STA) 42" or " (DOM) 123"
+# that many deck exporters append. The collector number is optional
+# (Moxfield often omits it, e.g. "Lightning Bolt (STA)").
+_DECKLIST_TRAILING_SET_RE = re.compile(r"\s*\([^)]+\)(?:\s+\S+)?\s*$")
+
+
+def parse_decklist_line(line: str) -> str | None:
+    """Extract a card name from a single decklist line, or return None to skip.
+
+    Handles the common formats we see from Moxfield, Archidekt, MTGGoldfish,
+    Arena exports, and hand-rolled text files:
+
+        "Card Name"                        # bare
+        "1 Card Name"                      # basic MTG decklist
+        "4x Card Name"                     # alt qty syntax
+        "1 Card Name (STA) 42"             # with set + collector number
+        "1 Card Name (STA)"                # with set only
+        "SB: 1 Card Name"                  # sideboard prefix
+
+    Also skips blank lines and comment lines starting with '#'. Double-
+    faced card names using the "Front // Back" convention pass through
+    unchanged — the leading-qty strip is anchored to the start of the
+    line, and `//` never appears inside the trailing set-parens block.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    line = _DECKLIST_SIDEBOARD_RE.sub("", line)
+    line = _DECKLIST_LEADING_QTY_RE.sub("", line)
+    line = _DECKLIST_TRAILING_SET_RE.sub("", line)
+    line = line.strip()
+    return line or None
+
+
 def read_names(args: argparse.Namespace) -> list[str]:
     """Collect card names from the --file input and CLI positional args.
 
-    Blank lines and lines starting with '#' in the file are skipped. Names
-    are de-duplicated case-insensitively while preserving the order in which
-    they were first seen (helpful for readable progress output).
+    Every line/arg is fed through `parse_decklist_line`, so decklist-style
+    inputs ("1 Lightning Bolt (STA) 42") are normalised to bare names.
+    Blank lines and '#' comments are dropped. Names are de-duplicated
+    case-insensitively while preserving the order in which they were
+    first seen (helpful for readable progress output).
     """
-    names: list[str] = []
+    raw: list[str] = []
     if args.file:
         for line in Path(args.file).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                names.append(line)
-    names.extend(args.cards)
+            raw.append(line)
+    raw.extend(args.cards)
 
     seen: set[str] = set()
     out: list[str] = []
-    for n in names:
-        key = n.lower()
+    for line in raw:
+        name = parse_decklist_line(line)
+        if name is None:
+            continue
+        key = name.lower()
         if key not in seen:
             seen.add(key)
-            out.append(n)
+            out.append(name)
     return out
 
 

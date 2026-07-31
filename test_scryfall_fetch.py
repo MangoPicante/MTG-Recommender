@@ -82,6 +82,33 @@ DELVER_RAW = {
     ],
 }
 
+# A modal double-faced card (MDFC) — Scryfall gives us null for the
+# top-level oracle_text and mana_cost; only card_faces[*] has the real
+# per-face data. Used to verify the per-face fallback in
+# extract_card_fields.
+BALA_GED_MDFC_RAW = {
+    "id": "id-bala-ged",
+    "name": "Bala Ged Recovery // Bala Ged Sanctuary",
+    "mana_cost": None,
+    "type_line": "Sorcery // Land",
+    "oracle_text": None,
+    "card_faces": [
+        {
+            "name": "Bala Ged Recovery",
+            "mana_cost": "{2}{G}",
+            "type_line": "Sorcery",
+            "oracle_text": "Return target card from your graveyard to your hand.",
+        },
+        {
+            "name": "Bala Ged Sanctuary",
+            "mana_cost": "",
+            "type_line": "Land",
+            "oracle_text": "This land enters tapped.\n{T}: Add {G}.",
+        },
+    ],
+}
+
+
 # An art-card variant whose faces both share a name. Used to exercise
 # alias-collision cases that motivated list-valued aliases.
 DELVER_ART_RAW = {
@@ -141,6 +168,56 @@ class TestCardProjection(unittest.TestCase):
         self.assertIsNone(result["mana_cost"])
         self.assertIsNone(result["type_line"])
         self.assertIsNone(result["oracle_text"])
+
+    def test_mdfc_null_toplevel_falls_back_to_joined_string(self):
+        # Bala Ged Recovery: top-level mana_cost / oracle_text are null,
+        # per-face values live under card_faces. The projection joins
+        # per-face mana costs with " // " (Scryfall's own convention for
+        # combined card names), preserving the empty back-face cost as
+        # a trailing empty string ("{2}{G} // ").
+        result = sf.extract_card_fields(BALA_GED_MDFC_RAW, updated_at=LATER)
+        self.assertEqual(result["mana_cost"], "{2}{G} // ")
+        # type_line was populated at the top level, so it stays as-is
+        # (Scryfall combined it for us).
+        self.assertEqual(result["type_line"], "Sorcery // Land")
+        # oracle_text still gets the "\n---\n" treatment for downstream
+        # text processing — clearer face boundary for NLP tokenisers.
+        self.assertIn("Return target card", result["oracle_text"])
+        self.assertIn("Add {G}", result["oracle_text"])
+        self.assertIn("\n---\n", result["oracle_text"])
+
+    def test_null_toplevel_type_line_joins_per_face_with_slashes(self):
+        # Hypothetical layout where Scryfall didn't combine type_line at
+        # the top level either (e.g. some Room / split layouts). We
+        # should still emit "Creature // Enchantment"-style output.
+        raw = {
+            "id": "x",
+            "name": "Front // Back",
+            "mana_cost": None,
+            "type_line": None,
+            "card_faces": [
+                {"name": "Front", "mana_cost": "{2}{U}", "type_line": "Creature"},
+                {"name": "Back", "mana_cost": "{1}{R}", "type_line": "Enchantment"},
+            ],
+        }
+        result = sf.extract_card_fields(raw, updated_at=LATER)
+        self.assertEqual(result["mana_cost"], "{2}{U} // {1}{R}")
+        self.assertEqual(result["type_line"], "Creature // Enchantment")
+
+    def test_transform_dfc_prefers_populated_toplevel_fields(self):
+        # Delver's front-face mana cost bubbles up to the top level, so
+        # we prefer the top-level string rather than making up a list.
+        # (Same for its combined type_line.)
+        result = sf.extract_card_fields(DELVER_RAW, updated_at=LATER)
+        self.assertEqual(result["mana_cost"], "{U}")
+        self.assertEqual(result["type_line"], DELVER_RAW["type_line"])
+
+    def test_single_face_card_keeps_scalar_fields(self):
+        # Regression guard: adding per-face fallback must not turn every
+        # card into a list. Single-faced cards keep their string values.
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        self.assertEqual(result["mana_cost"], "{R}")
+        self.assertEqual(result["type_line"], "Instant")
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +485,79 @@ class TestReadNames(unittest.TestCase):
             )
             # "Lightning Bolt" from args is deduped against the file entry.
             self.assertEqual(names, ["Sol Ring", "Lightning Bolt", "Counterspell"])
+
+    def test_decklist_format_strips_leading_quantities(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "deck.txt"
+            p.write_text(
+                "1 Sol Ring\n10 Forest\n4x Lightning Bolt\n",
+                encoding="utf-8",
+            )
+            names = sf.read_names(self._args(file=str(p)))
+            self.assertEqual(names, ["Sol Ring", "Forest", "Lightning Bolt"])
+
+    def test_decklist_format_preserves_dfc_slashes(self):
+        # DFC names have "//" inside them — the qty strip must not clip
+        # anything past the first word.
+        with TemporaryDirectory() as d:
+            p = Path(d) / "deck.txt"
+            p.write_text(
+                "1 Bala Ged Recovery // Bala Ged Sanctuary\n"
+                "1 Emeritus of Abundance // Regrowth\n",
+                encoding="utf-8",
+            )
+            names = sf.read_names(self._args(file=str(p)))
+            self.assertEqual(
+                names,
+                [
+                    "Bala Ged Recovery // Bala Ged Sanctuary",
+                    "Emeritus of Abundance // Regrowth",
+                ],
+            )
+
+    def test_decklist_format_strips_set_and_collector_suffix(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "deck.txt"
+            p.write_text(
+                "1 Lightning Bolt (STA) 42\n"
+                "4 Counterspell (LEA)\n"        # collector number omitted
+                "1 Bala Ged Recovery // Bala Ged Sanctuary (ZNR) 180\n",
+                encoding="utf-8",
+            )
+            names = sf.read_names(self._args(file=str(p)))
+            self.assertEqual(
+                names,
+                [
+                    "Lightning Bolt",
+                    "Counterspell",
+                    "Bala Ged Recovery // Bala Ged Sanctuary",
+                ],
+            )
+
+    def test_decklist_format_strips_sideboard_prefix(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "deck.txt"
+            p.write_text("SB: 1 Force of Will\nSB: 2 Flusterstorm\n", encoding="utf-8")
+            names = sf.read_names(self._args(file=str(p)))
+            self.assertEqual(names, ["Force of Will", "Flusterstorm"])
+
+    def test_parse_decklist_line_directly(self):
+        # A few edge cases surfaced as a table for easier scanning.
+        cases = [
+            ("1 Sol Ring", "Sol Ring"),
+            ("10 Forest", "Forest"),
+            ("4x Lightning Bolt", "Lightning Bolt"),
+            ("Sol Ring", "Sol Ring"),                                # already bare
+            ("  1  Sol Ring  ", "Sol Ring"),                         # extra whitespace
+            ("SB: 1 Force of Will (EMA) 49", "Force of Will"),       # everything
+            ("1 Bala Ged Recovery // Bala Ged Sanctuary", "Bala Ged Recovery // Bala Ged Sanctuary"),
+            ("# comment", None),
+            ("", None),
+            ("   ", None),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(sf.parse_decklist_line(raw), expected)
 
 
 # ---------------------------------------------------------------------------
